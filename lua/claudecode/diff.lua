@@ -858,6 +858,7 @@ local function register_diff_autocmds(tab_name, new_buffer)
     buffer = new_buffer,
     callback = function()
       M._resolve_diff_as_saved(tab_name, new_buffer)
+      pcall(vim.cmd, "diffoff")
       -- Prevent actual file write since we're handling it through MCP
       return true
     end,
