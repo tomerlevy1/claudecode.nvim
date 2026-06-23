@@ -141,6 +141,13 @@ local function find_main_editor_window()
       is_suitable = false
     end
 
+    -- Skip windows already in diff mode -- a user vimdiff/diffview.nvim/fugitive
+    -- pane, or one of claudecode's own diff panes. Opening a file into one
+    -- clears its window-local 'diff' and destroys that diff layout (issue #277).
+    if is_suitable and vim.api.nvim_win_get_option(win, "diff") then
+      is_suitable = false
+    end
+
     if
       is_suitable
       and (
@@ -169,6 +176,27 @@ end
 
 -- Exposed for testing the sidebar/explorer exclusion logic.
 M._find_main_editor_window = find_main_editor_window
+
+---Whether the given tabpage contains any window in diff mode. A Neovim diff is
+---scoped to a tabpage -- every &diff window in a tab participates in one shared
+---diff set -- so if a tab already hosts a foreign diff (vimdiff/diffview.nvim/
+---fugitive), creating Claude's diff in that tab would make its panes join and
+---corrupt the user's review. Such cases are routed to a dedicated tab instead
+---(issue #277). At diff-setup time claudecode has not created its own diff
+---windows yet, so any match here is a foreign diff.
+---@param tabpage integer Tabpage handle (0 = current)
+---@return boolean
+local function tabpage_has_diff_window(tabpage)
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+    if vim.api.nvim_win_get_option(win, "diff") then
+      return true
+    end
+  end
+  return false
+end
+
+-- Exposed for testing the foreign-diff-tab detection.
+M._tabpage_has_diff_window = tabpage_has_diff_window
 
 ---Find the Claude Code terminal window to keep focus there.
 ---Uses the terminal provider to get the active terminal buffer, then finds its window.
@@ -282,6 +310,21 @@ local function get_default_terminal_options()
   }
 end
 
+---Mark the current buffer (just created by tabnew) as ephemeral so it auto-wipes when hidden.
+local function mark_tabnew_buffer_ephemeral()
+  local buf = vim.api.nvim_get_current_buf()
+  local ok_name, name = pcall(vim.api.nvim_buf_get_name, buf)
+  local ok_mod, modified = pcall(vim.api.nvim_buf_get_option, buf, "modified")
+  local ok_lc, linecount = pcall(function()
+    return vim.api.nvim_buf_line_count(buf)
+  end)
+  if ok_name and ok_mod and ok_lc then
+    if (name == nil or name == "") and modified == false and linecount <= 1 then
+      pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "wipe")
+    end
+  end
+end
+
 ---Display existing Claude Code terminal in new tab
 ---@return number original_tab The original tab number
 ---@return number? terminal_win Terminal window in new tab
@@ -294,6 +337,7 @@ local function display_terminal_in_new_tab()
   local terminal_ok, terminal_module = pcall(require, "claudecode.terminal")
   if not terminal_ok then
     vim.cmd("tabnew")
+    mark_tabnew_buffer_ephemeral()
     local new_tab = vim.api.nvim_get_current_tabpage()
     return original_tab, nil, false, new_tab
   end
@@ -301,6 +345,7 @@ local function display_terminal_in_new_tab()
   local terminal_bufnr = terminal_module.get_active_terminal_bufnr()
   if not terminal_bufnr or not vim.api.nvim_buf_is_valid(terminal_bufnr) then
     vim.cmd("tabnew")
+    mark_tabnew_buffer_ephemeral()
     local new_tab = vim.api.nvim_get_current_tabpage()
     return original_tab, nil, false, new_tab
   end
@@ -315,21 +360,8 @@ local function display_terminal_in_new_tab()
   end
 
   vim.cmd("tabnew")
+  mark_tabnew_buffer_ephemeral()
   local new_tab = vim.api.nvim_get_current_tabpage()
-
-  -- Mark the initial, unnamed buffer in the new tab as ephemeral to avoid leaks
-  -- When this buffer gets hidden (replaced or tab closed), wipe it automatically.
-  local initial_buf = vim.api.nvim_get_current_buf()
-  local name_ok, initial_name = pcall(vim.api.nvim_buf_get_name, initial_buf)
-  local mod_ok, initial_modified = pcall(vim.api.nvim_buf_get_option, initial_buf, "modified")
-  local linecount_ok, initial_linecount = pcall(function()
-    return vim.api.nvim_buf_line_count(initial_buf)
-  end)
-  if name_ok and mod_ok and linecount_ok then
-    if (initial_name == nil or initial_name == "") and initial_modified == false and initial_linecount <= 1 then
-      pcall(vim.api.nvim_buf_set_option, initial_buf, "bufhidden", "wipe")
-    end
-  end
 
   local terminal_config = config.terminal or {}
   local split_side = terminal_config.split_side or "right"
@@ -798,6 +830,13 @@ function M._resolve_diff_as_saved(tab_name, buffer_id)
     return
   end
 
+  -- Dispatch to inline diff handler
+  if diff_data.layout == "inline" then
+    local inline = require("claudecode.diff_inline")
+    inline.resolve_inline_as_saved(tab_name, diff_data)
+    return
+  end
+
   logger.debug("diff", "Accepting diff for", tab_name)
 
   -- Get content from buffer
@@ -882,6 +921,13 @@ end
 function M._resolve_diff_as_rejected(tab_name)
   local diff_data = active_diffs[tab_name]
   if not diff_data or diff_data.status ~= "pending" then
+    return
+  end
+
+  -- Dispatch to inline diff handler
+  if diff_data.layout == "inline" then
+    local inline = require("claudecode.diff_inline")
+    inline.resolve_inline_as_rejected(tab_name, diff_data)
     return
   end
 
@@ -1108,6 +1154,14 @@ function M._cleanup_diff_state(tab_name, reason)
     return
   end
 
+  -- Dispatch to inline diff handler
+  if diff_data.layout == "inline" then
+    local inline = require("claudecode.diff_inline")
+    inline.cleanup_inline_diff(tab_name, diff_data)
+    active_diffs[tab_name] = nil
+    return
+  end
+
   -- Clean up autocmds
   for _, autocmd_id in ipairs(diff_data.autocmd_ids or {}) do
     pcall(vim.api.nvim_del_autocmd, autocmd_id)
@@ -1249,6 +1303,13 @@ function M._setup_blocking_diff(params, resolution_callback)
       end
     end
 
+    -- Dispatch to inline diff if configured
+    if config and config.diff_opts and config.diff_opts.layout == "inline" then
+      local inline = require("claudecode.diff_inline")
+      inline.setup_inline_diff(params, resolution_callback, config)
+      return
+    end
+
     local original_tab_number = vim.api.nvim_get_current_tabpage()
     local created_new_tab = false
     local terminal_win_in_new_tab = nil
@@ -1290,7 +1351,10 @@ function M._setup_blocking_diff(params, resolution_callback)
 
         if existing_buffer then
           for _, win in ipairs(vim.api.nvim_list_wins()) do
-            if vim.api.nvim_win_get_buf(win) == existing_buffer then
+            -- Don't reuse a window that is already in diff mode (e.g. the old
+            -- file shown inside the user's diffview/vimdiff): diffing into it
+            -- would join and corrupt that diff (issue #277).
+            if vim.api.nvim_win_get_buf(win) == existing_buffer and not vim.api.nvim_win_get_option(win, "diff") then
               target_window = win
               break
             end
@@ -1301,11 +1365,31 @@ function M._setup_blocking_diff(params, resolution_callback)
       if not target_window then
         target_window = find_main_editor_window()
       end
+
+      -- A Neovim diff is scoped to its tabpage: all &diff windows in a tab share
+      -- one diff set. If the tab that would host Claude's diff already contains a
+      -- foreign diff (vimdiff/diffview.nvim/fugitive), running `diffthis` there
+      -- makes Claude's panes join and corrupt it -- even when a usable non-diff
+      -- window exists in that tab. So check the destination tab (the candidate
+      -- window's tab, or the current tab if none was found) and isolate the diff
+      -- in a dedicated tab when it already hosts a diff (issue #277). Mirrors the
+      -- open_in_new_tab path, including the issue #262 hoisting so a failure
+      -- before registration can still close the new tab.
+      local dest_tab = (target_window and vim.api.nvim_win_is_valid(target_window))
+          and vim.api.nvim_win_get_tabpage(target_window)
+        or vim.api.nvim_get_current_tabpage()
+      if tabpage_has_diff_window(dest_tab) then
+        original_tab_handle = vim.api.nvim_get_current_tabpage()
+        original_tab_number, terminal_win_in_new_tab, had_terminal_in_original, new_tab_handle =
+          display_terminal_in_new_tab()
+        created_new_tab = true
+        target_window = nil
+      end
     end
     -- If created_new_tab is true, target_window stays nil and will be created in the new tab.
     -- Otherwise, if no editor window is suitable (e.g. the Claude terminal is the only window --
-    -- issue #231), create one by splitting the current window instead of erroring out, mirroring
-    -- the fallback in lua/claudecode/tools/open_file.lua.
+    -- issue #231) and the tab has no foreign diff to corrupt, create one by splitting the current
+    -- window instead of erroring out, mirroring the fallback in lua/claudecode/tools/open_file.lua.
     if not target_window and not created_new_tab then
       create_split()
       local scratch_buf = vim.api.nvim_create_buf(false, true) -- unlisted, scratch
@@ -1692,6 +1776,18 @@ end
 ---This function reads the diff context from buffer variables
 function M.accept_current_diff()
   local current_buffer = vim.api.nvim_get_current_buf()
+
+  -- Check for inline diff buffer first
+  if vim.b[current_buffer].claudecode_inline_diff then
+    local tab_name = vim.b[current_buffer].claudecode_diff_tab_name
+    if tab_name then
+      M._resolve_diff_as_saved(tab_name, current_buffer)
+    else
+      vim.notify("No active diff found in current buffer", vim.log.levels.WARN)
+    end
+    return
+  end
+
   local tab_name = vim.b[current_buffer].claudecode_diff_tab_name
 
   if not tab_name then
@@ -1706,6 +1802,18 @@ end
 ---This function reads the diff context from buffer variables
 function M.deny_current_diff()
   local current_buffer = vim.api.nvim_get_current_buf()
+
+  -- Check for inline diff buffer first
+  if vim.b[current_buffer].claudecode_inline_diff then
+    local tab_name = vim.b[current_buffer].claudecode_diff_tab_name
+    if tab_name then
+      M._resolve_diff_as_rejected(tab_name)
+    else
+      vim.notify("No active diff found in current buffer", vim.log.levels.WARN)
+    end
+    return
+  end
+
   local tab_name = vim.b[current_buffer].claudecode_diff_tab_name
 
   if not tab_name then
@@ -1716,6 +1824,14 @@ function M.deny_current_diff()
   -- Do not close windows/tabs here; just mark as rejected.
   M._resolve_diff_as_rejected(tab_name)
 end
+
+-- Expose internal utilities for use by diff_inline.lua
+M._find_main_editor_window = find_main_editor_window
+M._find_claudecode_terminal_window = find_claudecode_terminal_window
+M._is_buffer_dirty = is_buffer_dirty
+M._detect_filetype = detect_filetype
+M._get_autocmd_group = get_autocmd_group
+M._display_terminal_in_new_tab = display_terminal_in_new_tab
 
 return M
 ---@alias NvimWin integer
